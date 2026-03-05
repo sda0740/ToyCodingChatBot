@@ -1,0 +1,169 @@
+# app.py — 로컬 챗봇 (한국어 고정, 대화기억, 자동요약, 저장/불러오기)
+# pip install gpt4all ollama
+
+import json, os, sys
+from collections import deque
+from datetime import datetime
+
+BACKEND = "ollama"  # "ollama" 또는 "gpt4all"
+
+# ---- 공통 설정 ----
+HISTORY_PATH = "chat_history.json"
+MAX_MSG = 800
+SUMMARIZE_TAKE = 200
+SYSTEM_BASE = (
+    "당신은 한국어로만 대답하는 친절한 AI 어시스턴트입니다. "
+    "반드시 간결하고 정확하게 답하세요. 불필요한 반복은 피하세요. "
+    "사용자 요청이 모호하면 짧게 되물어 확인하세요."
+)
+
+# ---- gpt4all 설정(오프라인 파일) ----
+G4A_MODEL_FILE = "qwen2.5-1.5b-instruct-q4_0.gguf"
+G4A_MODEL_DIR  = "models"
+
+# ---- Ollama 설정 ----
+OLLAMA_MODEL = "llama3.1:8b"  # 또는 "llama3.1:8b"
+OLLAMA_OPTIONS = {"temperature": 0.4, "top_p": 0.9, "repeat_penalty": 1.15, "num_ctx": 4096}
+
+# ---- 상태 ----
+history: deque[dict] = deque(maxlen=MAX_MSG)
+summary_note: str = ""
+
+# ---- 공통 유틸 ----
+def load_state(path=HISTORY_PATH):
+    global history, summary_note
+    if not os.path.exists(path): return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for m in data.get("history", [])[-MAX_MSG:]:
+            if isinstance(m, dict) and "role" in m and "content" in m:
+                history.append(m)
+        summary_note = data.get("summary_note", "")
+    except Exception as e:
+        print(f"[경고] 저장 파일 로드 실패: {e}")
+
+def save_state(path=HISTORY_PATH):
+    try:
+        data = {
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "summary_note": summary_note,
+            "history": list(history),
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[경고] 저장 실패: {e}")
+
+def messages_to_text(msgs):
+    lines = []
+    for m in msgs:
+        role = m.get("role","")
+        content = m.get("content","").replace("\n"," ").strip()
+        lines.append(f"{role}: {content}")
+    return "\n".join(lines)
+
+def summarize_recent(generate_fn):
+    """generate_fn(prompt:str)->str 를 받아 요약만 수행"""
+    global summary_note, history
+    if len(history) < MAX_MSG: return False
+    snippet = messages_to_text(list(history)[-SUMMARIZE_TAKE:])
+    prompt = (
+        "다음은 사용자(user)와 어시스턴트(assistant)의 최근 대화 기록입니다.\n"
+        "핵심만 한국어 bullet 5줄 이내로 간결히 요약하세요.\n\n"
+        f"{snippet}\n\n요약:"
+    )
+    summary = generate_fn(prompt).strip()
+    combined = f"{summary_note}\n\n[최근 요약]\n{summary}" if summary_note else summary
+    # 길이 제한
+    summary_note = combined[:4000]
+    history.clear()
+    return True
+
+def build_system_prompt():
+    return f"{SYSTEM_BASE}\n\n[이전 대화 요약]\n{summary_note}" if summary_note else SYSTEM_BASE
+
+# ---- 백엔드: gpt4all ----
+def run_gpt4all():
+    # 지연 import
+    from gpt4all import GPT4All
+    model_file = G4A_MODEL_FILE
+    model_dir  = G4A_MODEL_DIR
+    path = os.path.join(model_dir, model_file)
+    if not os.path.exists(path):
+        print(f"[오류] 로컬 모델 파일이 없습니다: {path}")
+        sys.exit(1)
+    g4a = GPT4All(model_name=model_file, model_path=model_dir, allow_download=False)
+    print("로컬 챗봇(gpt4all) 시작! (종료: exit/quit, Ctrl+C)\n")
+
+    def generate_fn(prompt: str) -> str:
+        return g4a.generate(prompt, max_tokens=512, temp=0.4)
+
+    while True:
+        system_prompt = build_system_prompt()
+        with g4a.chat_session(system_prompt=system_prompt):
+            while True:
+                try:
+                    q = input("You: ").strip()
+                except EOFError:
+                    print("\n종료합니다."); return
+                if q.lower() in ("exit","quit"):
+                    print("종료합니다."); return
+                history.append({"role":"user","content":q})
+                try:
+                    a = g4a.generate(q, max_tokens=512, temp=0.4)
+                except Exception as e:
+                    a = f"[오류] 생성 실패: {e}"
+                print("AI:", a)
+                history.append({"role":"assistant","content":a})
+                if len(history) >= MAX_MSG and summarize_recent(generate_fn):
+                    print("\n[안내] 대화 요약 후 컨텍스트 갱신했습니다. 계속 대화하세요.\n")
+                    break
+
+# ---- 백엔드: Ollama ----
+def run_ollama():
+    # 지연 import
+    import ollama
+    print("로컬 챗봇(ollama) 시작! (종료: exit/quit, Ctrl+C)\n")
+
+    def generate_fn(prompt: str) -> str:
+        resp = ollama.chat(
+            model=OLLAMA_MODEL,
+            messages=[{"role":"system","content":build_system_prompt()},
+                      {"role":"user","content":prompt}],
+            options=OLLAMA_OPTIONS
+        )
+        return resp["message"]["content"]
+
+    while True:
+        try:
+            q = input("You: ").strip()
+        except EOFError:
+            print("\n종료합니다."); return
+        if q.lower() in ("exit","quit"):
+            print("종료합니다."); return
+
+        history.append({"role":"user","content":q})
+        try:
+            # 직전 요약/컨텍스트를 포함해 질의
+            resp = generate_fn(q)
+        except Exception as e:
+            resp = f"[오류] 생성 실패: {e}"
+        print("AI:", resp)
+        history.append({"role":"assistant","content":resp})
+
+        if len(history) >= MAX_MSG and summarize_recent(generate_fn):
+            print("\n[안내] 대화 요약 후 컨텍스트 갱신했습니다. 계속 대화하세요.\n")
+
+# ---- 엔트리 ----
+if __name__ == "__main__":
+    try:
+        load_state()
+        if BACKEND == "ollama":
+            run_ollama()
+        else:
+            run_gpt4all()
+    except KeyboardInterrupt:
+        print("\n종료합니다.")
+    finally:
+        save_state()
